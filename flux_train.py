@@ -448,8 +448,9 @@ def train(args):
         # accelerator does some magic
         # if we doesn't swap blocks, we can move the model to device
         flux = accelerator.prepare(flux, device_placement=[not is_swapping_blocks])
+        device = accelerator.device
         if is_swapping_blocks:
-            accelerator.unwrap_model(flux).move_to_device_except_swap_blocks(accelerator.device)  # reduce peak memory usage
+            accelerator.unwrap_model(flux).to(device)
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     # 実験的機能：勾配も含めたfp16学習を行う　PyTorchにパッチを当ててfp16でのgrad scaleを有効にする
@@ -774,6 +775,18 @@ def train(args):
 
                 # call model
                 l_pooled, t5_out, txt_ids, t5_attn_mask = text_encoder_conds
+
+                packed_noisy_model_input = packed_noisy_model_input.to(accelerator.device)
+                img_ids = img_ids.to(accelerator.device)
+                t5_out = t5_out.to(accelerator.device)
+                txt_ids = txt_ids.to(accelerator.device)
+                l_pooled = l_pooled.to(accelerator.device)
+                timesteps = timesteps.to(accelerator.device)
+                guidance_vec = guidance_vec.to(accelerator.device)
+                if t5_attn_mask is not None:
+                    t5_attn_mask = t5_attn_mask.to(accelerator.device)
+
+
                 if not args.apply_t5_attn_mask:
                     t5_attn_mask = None
 

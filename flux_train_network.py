@@ -68,9 +68,13 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         loading_dtype = None if args.fp8_base else weight_dtype
 
         # if we load to cpu, flux.to(fp8) takes a long time, so we should load to gpu in future
+        # model = flux_utils.load_flow_model(
+        #     name, args.pretrained_model_name_or_path, loading_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors
+        # )
         model = flux_utils.load_flow_model(
             name, args.pretrained_model_name_or_path, loading_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors
         )
+
         if args.fp8_base:
             # check dtype of model
             if model.dtype == torch.float8_e4m3fnuz or model.dtype == torch.float8_e5m2 or model.dtype == torch.float8_e5m2fnuz:
@@ -204,12 +208,12 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
     ):
         if args.cache_text_encoder_outputs:
             if not args.lowram:
-                # メモリ消費を減らす
+                # Reduce memory consumption
                 logger.info("move vae and unet to cpu to save memory")
                 org_vae_device = vae.device
                 org_unet_device = unet.device
                 vae.to("cpu")
-                unet.to("cpu")
+                unet.to_empty(device="cpu")
                 clean_memory_on_device(accelerator.device)
 
             # When TE is not be trained, it will not be prepared so we need to use explicit autocast
@@ -259,8 +263,16 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
             if not args.lowram:
                 logger.info("move vae and unet back to original device")
+
+                # Handle VAE
                 vae.to(org_vae_device)
-                unet.to(org_unet_device)
+
+                # Handle UNet
+                if any(param.is_meta for param in unet.parameters()):
+                    unet.to_empty(device=org_unet_device)
+                else:
+                    unet.to(org_unet_device)
+
         else:
             # Text Encoderから毎回出力を取得するので、GPUに乗せておく
             text_encoders[0].to(accelerator.device, dtype=weight_dtype)

@@ -597,7 +597,10 @@ class NetworkTrainer:
             )
             training_model = ds_model
         else:
-            if train_unet:
+            if any(param.is_meta for param in unet.parameters()):
+                logger.info("Moving UNet from meta device to accelerator device")
+                unet.to_empty(device=accelerator.device)
+            elif train_unet:
                 unet = accelerator.prepare(unet)
             else:
                 unet.to(accelerator.device, dtype=unet_weight_dtype)  # move to device because unet is not prepared by accelerator
