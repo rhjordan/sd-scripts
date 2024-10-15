@@ -4873,6 +4873,21 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             raise ValueError(f"{name} does not require `num_warmup_steps`. Set None or 0.")
         return return_vals
 
+    # Custom learning rate schedule
+    if name == "custom_schedule":
+        def lr_lambda(current_step: int):
+            if current_step < 5 * num_training_steps // 335:
+                return 1e-4
+            elif current_step < 15 * num_training_steps // 335:
+                return 1e-5
+            elif current_step < 55 * num_training_steps // 335:
+                return 5e-5
+            elif current_step < 135 * num_training_steps // 335:
+                return 1e-6
+            else:
+                return 1e-7
+        return LambdaLR(optimizer, lr_lambda)
+
     # using any lr_scheduler from other library
     if args.lr_scheduler_type:
         lr_scheduler_type = args.lr_scheduler_type
@@ -4952,6 +4967,9 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
             num_training_steps=num_training_steps,
             **lr_scheduler_kwargs,
         )
+    
+    if name == SchedulerType.REDUCE_ON_PLATEAU:
+        return schedule_func(optimizer, **lr_scheduler_kwargs)  # No num_warmup_steps for ReduceLROnPlateau
 
     # All other schedulers require `num_decay_steps`
     if num_decay_steps is None:
