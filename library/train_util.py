@@ -30,6 +30,7 @@ import random
 import hashlib
 import subprocess
 from io import BytesIO
+from torch.optim.lr_scheduler import LambdaLR
 import toml
 
 from tqdm import tqdm
