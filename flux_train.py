@@ -817,6 +817,11 @@ def train(args):
                 # backward
                 accelerator.backward(loss)
 
+                # Print the learning rate
+                if accelerator.is_main_process:
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    print(f"Current learning rate: {current_lr:.6f}")
+
                 if not (args.fused_backward_pass or args.blockwise_fused_optimizers):
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         params_to_clip = []
