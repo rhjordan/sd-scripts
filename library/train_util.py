@@ -4878,12 +4878,12 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     if name == "custom_schedule":
         # Define the learning rates and their corresponding epoch percentages
         lr_schedule = [
-            (0.00, 1e-4),  # Start with 1e-4
-            (0.01, 1e-4),  # Hold 1e-4 for 1% of total epochs
-            (0.05, 1e-5),  # Decrease to 1e-5 by 5% of total epochs
-            (0.15, 5e-5),  # Increase to 5e-5 by 15% of total epochs
-            (0.40, 1e-6),  # Decrease to 1e-6 by 40% of total epochs
-            (1.00, 1e-7),  # End with 1e-7
+            (0.00, 1e-4),
+            (0.02, 1e-4),
+            (0.10, 1e-5),
+            (0.20, 5e-5),
+            (0.60, 1e-6),
+            (1.00, 1e-10),
         ]
 
         def lr_lambda(current_step: int):
