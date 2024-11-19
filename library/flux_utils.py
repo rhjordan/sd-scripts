@@ -1,3 +1,4 @@
+from dataclasses import replace
 import json
 import os
 from typing import List, Optional, Tuple, Union
@@ -9,42 +10,36 @@ from safetensors import safe_open
 from accelerate import init_empty_weights
 from transformers import CLIPTextModel, CLIPConfig, T5EncoderModel, T5Config
 
-from library import flux_models
-
-from library.utils import setup_logging, MemoryEfficientSafeOpen
+from library.utils import setup_logging
 
 setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
 
+from library import flux_models
+from library.utils import load_safetensors
+
 MODEL_VERSION_FLUX_V1 = "flux1"
 MODEL_NAME_DEV = "dev"
 MODEL_NAME_SCHNELL = "schnell"
 
 
-# temporary copy from sd3_utils TODO refactor
-def load_safetensors(
-    path: str, device: Union[str, torch.device], disable_mmap: bool = False, dtype: Optional[torch.dtype] = torch.float32
-):
-    if disable_mmap:
-        # return safetensors.torch.load(open(path, "rb").read())
-        # use experimental loader
-        logger.info(f"Loading without mmap (experimental)")
-        state_dict = {}
-        with MemoryEfficientSafeOpen(path) as f:
-            for key in f.keys():
-                state_dict[key] = f.get_tensor(key).to(device, dtype=dtype)
-        return state_dict
-    else:
-        try:
-            return load_file(path, device=device)
-        except:
-            return load_file(path)  # prevent device invalid Error
+def analyze_checkpoint_state(ckpt_path: str) -> Tuple[bool, bool, Tuple[int, int], List[str]]:
+    """
+    チェックポイントの状態を分析し、DiffusersかBFLか、devかschnellか、ブロック数を計算して返す。
 
+    Args:
+        ckpt_path (str): チェックポイントファイルまたはディレクトリのパス。
 
-def check_flux_state_dict_diffusers_schnell(ckpt_path: str) -> Tuple[bool, bool, List[str]]:
-    # check the state dict: Diffusers or BFL, dev or schnell
+    Returns:
+        Tuple[bool, bool, Tuple[int, int], List[str]]:
+            - bool: Diffusersかどうかを示すフラグ。
+            - bool: Schnellかどうかを示すフラグ。
+            - Tuple[int, int]: ダブルブロックとシングルブロックの数。
+            - List[str]: チェックポイントに含まれるキーのリスト。
+    """
+    # check the state dict: Diffusers or BFL, dev or schnell, number of blocks
     logger.info(f"Checking the state dict: Diffusers or BFL, dev or schnell")
 
     if os.path.isdir(ckpt_path):  # if ckpt_path is a directory, it is Diffusers
@@ -59,21 +54,63 @@ def check_flux_state_dict_diffusers_schnell(ckpt_path: str) -> Tuple[bool, bool,
         with safe_open(ckpt_path, framework="pt") as f:
             keys.extend(f.keys())
 
+    # if the key has annoying prefix, remove it
+    if keys[0].startswith("model.diffusion_model."):
+        keys = [key.replace("model.diffusion_model.", "") for key in keys]
+
     is_diffusers = "transformer_blocks.0.attn.add_k_proj.bias" in keys
     is_schnell = not ("guidance_in.in_layer.bias" in keys or "time_text_embed.guidance_embedder.linear_1.bias" in keys)
-    return is_diffusers, is_schnell, ckpt_paths
+
+    # check number of double and single blocks
+    if not is_diffusers:
+        max_double_block_index = max(
+            [int(key.split(".")[1]) for key in keys if key.startswith("double_blocks.") and key.endswith(".img_attn.proj.bias")]
+        )
+        max_single_block_index = max(
+            [int(key.split(".")[1]) for key in keys if key.startswith("single_blocks.") and key.endswith(".modulation.lin.bias")]
+        )
+    else:
+        max_double_block_index = max(
+            [
+                int(key.split(".")[1])
+                for key in keys
+                if key.startswith("transformer_blocks.") and key.endswith(".attn.add_k_proj.bias")
+            ]
+        )
+        max_single_block_index = max(
+            [
+                int(key.split(".")[1])
+                for key in keys
+                if key.startswith("single_transformer_blocks.") and key.endswith(".attn.to_k.bias")
+            ]
+        )
+
+    num_double_blocks = max_double_block_index + 1
+    num_single_blocks = max_single_block_index + 1
+
+    return is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths
 
 
 def load_flow_model(
     ckpt_path: str, dtype: Optional[torch.dtype], device: Union[str, torch.device], disable_mmap: bool = False
 ) -> Tuple[bool, flux_models.Flux]:
-    is_diffusers, is_schnell, ckpt_paths = check_flux_state_dict_diffusers_schnell(ckpt_path)
+    is_diffusers, is_schnell, (num_double_blocks, num_single_blocks), ckpt_paths = analyze_checkpoint_state(ckpt_path)
     name = MODEL_NAME_DEV if not is_schnell else MODEL_NAME_SCHNELL
 
     # build model
     logger.info(f"Building Flux model {name} from {'Diffusers' if is_diffusers else 'BFL'} checkpoint")
     with torch.device("meta"):
-        model = flux_models.Flux(flux_models.configs[name].params)
+        params = flux_models.configs[name].params
+
+        # set the number of blocks
+        if params.depth != num_double_blocks:
+            logger.info(f"Setting the number of double blocks from {params.depth} to {num_double_blocks}")
+            params = replace(params, depth=num_double_blocks)
+        if params.depth_single_blocks != num_single_blocks:
+            logger.info(f"Setting the number of single blocks from {params.depth_single_blocks} to {num_single_blocks}")
+            params = replace(params, depth_single_blocks=num_single_blocks)
+
+        model = flux_models.Flux(params)
         if dtype is not None:
             model = model.to(dtype)
 
@@ -86,8 +123,15 @@ def load_flow_model(
     # convert Diffusers to BFL
     if is_diffusers:
         logger.info("Converting Diffusers to BFL")
-        sd = convert_diffusers_sd_to_bfl(sd)
+        sd = convert_diffusers_sd_to_bfl(sd, num_double_blocks, num_single_blocks)
         logger.info("Converted Diffusers to BFL")
+
+    # if the key has annoying prefix, remove it
+    for key in list(sd.keys()):
+        new_key = key.replace("model.diffusion_model.", "")
+        if new_key == key:
+            break  # the model doesn't have annoying prefix
+        sd[new_key] = sd.pop(key)
 
     info = model.load_state_dict(sd, strict=False, assign=True)
     logger.info(f"Loaded Flux: {info}")
@@ -109,8 +153,14 @@ def load_ae(
     return ae
 
 
-def load_clip_l(ckpt_path: str, dtype: torch.dtype, device: Union[str, torch.device], disable_mmap: bool = False) -> CLIPTextModel:
-    logger.info("Building CLIP")
+def load_clip_l(
+    ckpt_path: Optional[str],
+    dtype: torch.dtype,
+    device: Union[str, torch.device],
+    disable_mmap: bool = False,
+    state_dict: Optional[dict] = None,
+) -> CLIPTextModel:
+    logger.info("Building CLIP-L")
     CLIPL_CONFIG = {
         "_name_or_path": "clip-vit-large-patch14/",
         "architectures": ["CLIPModel"],
@@ -203,15 +253,22 @@ def load_clip_l(ckpt_path: str, dtype: torch.dtype, device: Union[str, torch.dev
     with init_empty_weights():
         clip = CLIPTextModel._from_config(config)
 
-    logger.info(f"Loading state dict from {ckpt_path}")
-    sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+    if state_dict is not None:
+        sd = state_dict
+    else:
+        logger.info(f"Loading state dict from {ckpt_path}")
+        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
     info = clip.load_state_dict(sd, strict=False, assign=True)
-    logger.info(f"Loaded CLIP: {info}")
+    logger.info(f"Loaded CLIP-L: {info}")
     return clip
 
 
 def load_t5xxl(
-    ckpt_path: str, dtype: Optional[torch.dtype], device: Union[str, torch.device], disable_mmap: bool = False
+    ckpt_path: str,
+    dtype: Optional[torch.dtype],
+    device: Union[str, torch.device],
+    disable_mmap: bool = False,
+    state_dict: Optional[dict] = None,
 ) -> T5EncoderModel:
     T5_CONFIG_JSON = """
 {
@@ -251,8 +308,11 @@ def load_t5xxl(
     with init_empty_weights():
         t5xxl = T5EncoderModel._from_config(config)
 
-    logger.info(f"Loading state dict from {ckpt_path}")
-    sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+    if state_dict is not None:
+        sd = state_dict
+    else:
+        logger.info(f"Loading state dict from {ckpt_path}")
+        sd = load_safetensors(ckpt_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
     info = t5xxl.load_state_dict(sd, strict=False, assign=True)
     logger.info(f"Loaded T5xxl: {info}")
     return t5xxl
@@ -349,16 +409,16 @@ BFL_TO_DIFFUSERS_MAP = {
 }
 
 
-def make_diffusers_to_bfl_map() -> dict[str, tuple[int, str]]:
+def make_diffusers_to_bfl_map(num_double_blocks: int, num_single_blocks: int) -> dict[str, tuple[int, str]]:
     # make reverse map from diffusers map
     diffusers_to_bfl_map = {}  # key: diffusers_key, value: (index, bfl_key)
-    for b in range(NUM_DOUBLE_BLOCKS):
+    for b in range(num_double_blocks):
         for key, weights in BFL_TO_DIFFUSERS_MAP.items():
             if key.startswith("double_blocks."):
                 block_prefix = f"transformer_blocks.{b}."
                 for i, weight in enumerate(weights):
                     diffusers_to_bfl_map[f"{block_prefix}{weight}"] = (i, key.replace("()", f"{b}"))
-    for b in range(NUM_SINGLE_BLOCKS):
+    for b in range(num_single_blocks):
         for key, weights in BFL_TO_DIFFUSERS_MAP.items():
             if key.startswith("single_blocks."):
                 block_prefix = f"single_transformer_blocks.{b}."
@@ -371,8 +431,10 @@ def make_diffusers_to_bfl_map() -> dict[str, tuple[int, str]]:
     return diffusers_to_bfl_map
 
 
-def convert_diffusers_sd_to_bfl(diffusers_sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    diffusers_to_bfl_map = make_diffusers_to_bfl_map()
+def convert_diffusers_sd_to_bfl(
+    diffusers_sd: dict[str, torch.Tensor], num_double_blocks: int = NUM_DOUBLE_BLOCKS, num_single_blocks: int = NUM_SINGLE_BLOCKS
+) -> dict[str, torch.Tensor]:
+    diffusers_to_bfl_map = make_diffusers_to_bfl_map(num_double_blocks, num_single_blocks)
 
     # iterate over three safetensors files to reduce memory usage
     flux_sd = {}

@@ -18,6 +18,7 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from accelerate.utils import set_seed
+from accelerate import Accelerator
 from diffusers import DDPMScheduler
 from library import deepspeed_utils, model_util, strategy_base, strategy_sd
 
@@ -116,7 +117,7 @@ class NetworkTrainer:
 
     def get_latents_caching_strategy(self, args):
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(
-            True, args.cache_latents_to_disk, args.vae_batch_size, False
+            True, args.cache_latents_to_disk, args.vae_batch_size, args.skip_cache_check
         )
         return latents_caching_strategy
 
@@ -129,6 +130,7 @@ class NetworkTrainer:
     def get_models_for_text_encoding(self, args, accelerator, text_encoders):
         """
         Returns a list of models that will be used for text encoding. SDXL uses wrapped and unwrapped models.
+        FLUX.1 and SD3 may cache some outputs of the text encoder, so return the models that will be used for encoding (not cached).
         """
         return text_encoders
 
@@ -143,7 +145,7 @@ class NetworkTrainer:
         for t_enc in text_encoders:
             t_enc.to(accelerator.device, dtype=weight_dtype)
 
-    def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype):
+    def call_unet(self, args, accelerator, unet, noisy_latents, timesteps, text_conds, batch, weight_dtype, **kwargs):
         noise_pred = unet(noisy_latents, timesteps, text_conds[0]).sample
         return noise_pred
 
@@ -218,6 +220,30 @@ class NetworkTrainer:
         else:
             target = noise
 
+        # differential output preservation
+        if "custom_attributes" in batch:
+            diff_output_pr_indices = []
+            for i, custom_attributes in enumerate(batch["custom_attributes"]):
+                if "diff_output_preservation" in custom_attributes and custom_attributes["diff_output_preservation"]:
+                    diff_output_pr_indices.append(i)
+
+            if len(diff_output_pr_indices) > 0:
+                network.set_multiplier(0.0)
+                with torch.no_grad(), accelerator.autocast():
+                    noise_pred_prior = self.call_unet(
+                        args,
+                        accelerator,
+                        unet,
+                        noisy_latents,
+                        timesteps,
+                        text_encoder_conds,
+                        batch,
+                        weight_dtype,
+                        indices=diff_output_pr_indices,
+                    )
+                network.set_multiplier(1.0)  # may be overwritten by "network_multipliers" in the next step
+                target[diff_output_pr_indices] = noise_pred_prior.to(target.dtype)
+
         return noise_pred, target, timesteps, huber_c, None
 
     def post_process_loss(self, loss, args, timesteps, noise_scheduler):
@@ -228,7 +254,7 @@ class NetworkTrainer:
         if args.v_pred_like_loss:
             loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
         if args.debiased_estimation_loss:
-            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+            loss = apply_debiased_estimation(loss, timesteps, noise_scheduler, args.v_parameterization)
         return loss
 
     def get_sai_model_spec(self, args):
@@ -246,6 +272,14 @@ class NetworkTrainer:
 
     def prepare_text_encoder_fp8(self, index, text_encoder, te_weight_dtype, weight_dtype):
         text_encoder.text_model.embeddings.to(dtype=weight_dtype)
+
+    def prepare_unet_with_accelerator(
+        self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
+    ) -> torch.nn.Module:
+        return accelerator.prepare(unet)
+
+    def on_step_start(self, args, accelerator, network, text_encoders, unet, batch, weight_dtype):
+        pass
 
     # endregion
 
@@ -384,7 +418,7 @@ class NetworkTrainer:
             vae.requires_grad_(False)
             vae.eval()
 
-            train_dataset_group.new_cache_latents(vae, accelerator.is_main_process)
+            train_dataset_group.new_cache_latents(vae, accelerator)
 
             vae.to("cpu")
             clean_memory_on_device(accelerator.device)
@@ -567,7 +601,10 @@ class NetworkTrainer:
             # unet.to(accelerator.device)  # this makes faster `to(dtype)` below, but consumes 23 GB VRAM
             # unet.to(dtype=unet_weight_dtype)  # without moving to gpu, this takes a lot of time and main memory
 
-            unet.to(accelerator.device, dtype=unet_weight_dtype)  # this seems to be safer than above
+            # logger.info(f"set U-Net weight dtype to {unet_weight_dtype}, device to {accelerator.device}")
+            # unet.to(accelerator.device, dtype=unet_weight_dtype)  # this seems to be safer than above
+            logger.info(f"set U-Net weight dtype to {unet_weight_dtype}")
+            unet.to(dtype=unet_weight_dtype)  # do not move to device because unet is not prepared by accelerator
 
         unet.requires_grad_(False)
         unet.to(dtype=unet_weight_dtype)
@@ -598,7 +635,8 @@ class NetworkTrainer:
             training_model = ds_model
         else:
             if train_unet:
-                unet = accelerator.prepare(unet)
+                # default implementation is:  unet = accelerator.prepare(unet)
+                unet = self.prepare_unet_with_accelerator(args, accelerator, unet)  # accelerator does some magic here
             else:
                 unet.to(accelerator.device, dtype=unet_weight_dtype)  # move to device because unet is not prepared by accelerator
             if train_text_encoder:
@@ -1004,9 +1042,9 @@ class NetworkTrainer:
 
         # callback for step start
         if hasattr(accelerator.unwrap_model(network), "on_step_start"):
-            on_step_start = accelerator.unwrap_model(network).on_step_start
+            on_step_start_for_network = accelerator.unwrap_model(network).on_step_start
         else:
-            on_step_start = lambda *args, **kwargs: None
+            on_step_start_for_network = lambda *args, **kwargs: None
 
         # function for saving/removing
         def save_model(ckpt_name, unwrapped_nw, steps, epoch_no, force_sync_upload=False):
@@ -1087,7 +1125,10 @@ class NetworkTrainer:
                     continue
 
                 with accelerator.accumulate(training_model):
-                    on_step_start(text_encoder, unet)
+                    on_step_start_for_network(text_encoder, unet)
+
+                    # temporary, for batch processing
+                    self.on_step_start(args, accelerator, network, text_encoders, unet, batch, weight_dtype)
 
                     if "latents" in batch and batch["latents"] is not None:
                         latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
@@ -1119,18 +1160,18 @@ class NetworkTrainer:
                     text_encoder_outputs_list = batch.get("text_encoder_outputs_list", None)
                     if text_encoder_outputs_list is not None:
                         text_encoder_conds = text_encoder_outputs_list  # List of text encoder outputs
+
                     if len(text_encoder_conds) == 0 or text_encoder_conds[0] is None or train_text_encoder:
+                        # TODO this does not work if 'some text_encoders are trained' and 'some are not and not cached'
                         with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
                             # Get the text embedding for conditioning
                             if args.weighted_captions:
-                                # SD only
-                                encoded_text_encoder_conds = get_weighted_text_embeddings(
-                                    tokenizers[0],
-                                    text_encoder,
-                                    batch["captions"],
-                                    accelerator.device,
-                                    args.max_token_length // 75 if args.max_token_length else 1,
-                                    clip_skip=args.clip_skip,
+                                input_ids_list, weights_list = tokenize_strategy.tokenize_with_weights(batch["captions"])
+                                encoded_text_encoder_conds = text_encoding_strategy.encode_tokens_with_weights(
+                                    tokenize_strategy,
+                                    self.get_models_for_text_encoding(args, accelerator, text_encoders),
+                                    input_ids_list,
+                                    weights_list,
                                 )
                             else:
                                 input_ids = [ids.to(accelerator.device) for ids in batch["input_ids_list"]]
@@ -1139,8 +1180,8 @@ class NetworkTrainer:
                                     self.get_models_for_text_encoding(args, accelerator, text_encoders),
                                     input_ids,
                                 )
-                                if args.full_fp16:
-                                    encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
+                            if args.full_fp16:
+                                encoded_text_encoder_conds = [c.to(weight_dtype) for c in encoded_text_encoder_conds]
 
                         # if text_encoder_conds is not cached, use encoded_text_encoder_conds
                         if len(text_encoder_conds) == 0:
