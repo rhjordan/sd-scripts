@@ -412,13 +412,16 @@ def train(args):
     # データセット側にも学習ステップを送信
     train_dataset_group.set_max_train_steps(args.max_train_steps)
 
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
     # lr schedulerを用意する
     if args.blockwise_fused_optimizers:
         # prepare lr schedulers for each optimizer
-        lr_schedulers = [train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes) for optimizer in optimizers]
+        lr_schedulers = [train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes, num_train_epochs) for optimizer in optimizers]
         lr_scheduler = lr_schedulers[0]  # avoid error in the following code
     else:
-        lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+        lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes, num_train_epochs)
 
     # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
     if args.full_fp16:
@@ -572,7 +575,7 @@ def train(args):
     # For --sample_at_first
     optimizer_eval_fn()
     flux_train_utils.sample_images(accelerator, args, 0, global_step, flux, ae, [clip_l, t5xxl], sample_prompts_te_outputs)
-    optimizer_train_fn()
+    # optimizer_train_fn()
     if len(accelerator.trackers) > 0:
         # log empty object to commit the sample images to wandb
         accelerator.log({}, step=0)
@@ -685,24 +688,24 @@ def train(args):
                 # Print the learning rate
                 if accelerator.is_main_process:
                     current_lr = lr_scheduler.get_last_lr()[0]
-                    print(f"Current learning rate: {current_lr:.6f}")
+                    print(f"Current learning rate: {current_lr:.10f}")
 
                 if not (args.fused_backward_pass or args.blockwise_fused_optimizers):
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                         params_to_clip = []
                         for m in training_models:
                             params_to_clip.extend(m.parameters())
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        acceleratora.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     optimizer.step()
-                    lr_scheduler.step()
+                    # lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
-                else:
-                    # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
-                    lr_scheduler.step()
-                    if args.blockwise_fused_optimizers:
-                        for i in range(1, len(optimizers)):
-                            lr_schedulers[i].step()
+                # else:
+                #     # optimizer.step() and optimizer.zero_grad() are called in the optimizer hook
+                #     # lr_scheduler.step()
+                #     if args.blockwise_fused_optimizers:
+                #         for i in range(1, len(optimizers)):
+                #             lr_schedulers[i].step()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -729,6 +732,7 @@ def train(args):
                             accelerator.unwrap_model(flux),
                         )
                 optimizer_train_fn()
+                # lr_scheduler.step()
 
             current_loss = loss.detach().item()  # 平均なのでbatch sizeは関係ないはず
             if len(accelerator.trackers) > 0:
@@ -752,6 +756,7 @@ def train(args):
         accelerator.wait_for_everyone()
 
         optimizer_eval_fn()
+        lr_scheduler.step()
         if args.save_every_n_epochs is not None:
             if accelerator.is_main_process:
                 flux_train_utils.save_flux_model_on_epoch_end_or_stepwise(
@@ -768,7 +773,8 @@ def train(args):
         flux_train_utils.sample_images(
             accelerator, args, epoch + 1, global_step, flux, ae, [clip_l, t5xxl], sample_prompts_te_outputs
         )
-        optimizer_train_fn()
+        # optimizer_train_fn()
+        # lr_scheduler.step()
 
     is_main_process = accelerator.is_main_process
     # if is_main_process:

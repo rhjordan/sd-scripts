@@ -31,7 +31,8 @@ import random
 import hashlib
 import subprocess
 from io import BytesIO
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
+
 import toml
 
 # from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -713,7 +714,7 @@ class BaseDataset(torch.utils.data.Dataset):
     def set_current_epoch(self, epoch):
         if not self.current_epoch == epoch:  # epochが切り替わったらバケツをシャッフルする
             if epoch > self.current_epoch:
-                logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
+                # logger.info("epoch is incremented. current_epoch: {}, epoch: {}".format(self.current_epoch, epoch))
                 num_epochs = epoch - self.current_epoch
                 for _ in range(num_epochs):
                     self.current_epoch += 1
@@ -5031,16 +5032,17 @@ def get_dummy_scheduler(optimizer: Optimizer) -> Any:
 # Add some checking and features to the original function.
 
 
-def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
+def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int, num_train_epochs: int):
     """
     Unified API to get any scheduler from its name.
     """
-    # if schedulefree optimizer, return dummy scheduler
+    # if schedulefree optimizer, return dummy scheduler 
     if is_schedulefree_optimizer(optimizer, args):
         return get_dummy_scheduler(optimizer)
 
     name = args.lr_scheduler
-    num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
+    num_training_steps = args.max_train_steps * num_processes
+    
     num_warmup_steps: Optional[int] = (
         int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
     )
@@ -5066,27 +5068,43 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         return return_vals
 
     # Custom learning rate schedule
-    if name == "custom_schedule":
-        # Define the learning rates and their corresponding epoch percentages
-        lr_schedule = [
-            (0.00, 1e-4),
-            (0.02, 1e-4),
-            (0.10, 1e-5),
-            (0.20, 5e-5),
-            (0.60, 1e-6),
-            (1.00, 1e-10),
-        ]
+    if name == "custom_schedule_difficulty_1":
+        initial_lr = 5e-5
+        final_lr = 5e-15
+        return CosineAnnealingLR(optimizer, T_max=num_train_epochs, eta_min=final_lr)
+    
+    if name == "custom_schedule_difficulty_2":
+        initial_lr = 1e-6
+        final_lr = 5e-9
+        return CosineAnnealingLR(optimizer, T_max=num_train_epochs, eta_min=final_lr)
 
-        def lr_lambda(current_step: int):
-            step_ratio = current_step / num_training_steps
-            for i, (milestone, lr) in enumerate(lr_schedule):
-                if step_ratio <= milestone:
-                    if i == 0:
-                        return lr
-                    prev_milestone, prev_lr = lr_schedule[i-1]
-                    t = (step_ratio - prev_milestone) / (milestone - prev_milestone)
-                    return prev_lr + t * (lr - prev_lr)
-            return lr_schedule[-1][1]
+        # base_lr = optimizer.param_groups[0]["lr"]
+        
+        # # Define the learning rates and their corresponding epoch percentages
+        # lr_schedule = [
+        #     (0.00, 5e-8),  # 
+        #     (0.50, 5e-10),  # 
+        #     (1.00, 5e-12),  #
+        # ]
+
+        # def lr_lambda(current_step: int):
+        #     step_ratio = current_step / num_training_steps
+        #     # Just find the appropriate step range and return that value
+        #     for milestone, lr in lr_schedule:
+        #         if step_ratio <= milestone:
+        #             return lr / base_lr
+        #     return lr_schedule[-1][1] / base_lr
+
+        return LambdaLR(optimizer, lr_lambda)
+            # step_ratio = current_step / num_training_steps
+            # for i, (milestone, lr) in enumerate(lr_schedule):
+            #     if step_ratio <= milestone:
+            #         if i == 0:
+            #             return lr
+            #         prev_milestone, prev_lr = lr_schedule[i-1]
+            #         t = (step_ratio - prev_milestone) / (milestone - prev_milestone)
+            #         return prev_lr + t * (lr - prev_lr)
+            # return lr_schedule[-1][1]
 
         return LambdaLR(optimizer, lr_lambda)
 
