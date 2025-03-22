@@ -5075,7 +5075,7 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int, num_train_
     
     if name == "custom_schedule_difficulty_2":
         initial_lr = 1e-6
-        final_lr = 5e-9
+        final_lr = 5e-15
         return CosineAnnealingLR(optimizer, T_max=num_train_epochs, eta_min=final_lr)
 
         # base_lr = optimizer.param_groups[0]["lr"]
